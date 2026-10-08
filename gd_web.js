@@ -52,47 +52,68 @@ Module["expectedDataFileDownloads"]++;
     var REMOTE_PACKAGE_BASE = "gd_web.data";
     var REMOTE_PACKAGE_NAME = Module["locateFile"]?.(REMOTE_PACKAGE_BASE, "") ?? REMOTE_PACKAGE_BASE;
     var REMOTE_PACKAGE_SIZE = metadata["remote_package_size"];
-    async function fetchRemotePackage(packageName, packageSize) {
+async function fetchRemotePackage(packageName, packageSize) {
       if (isNode) {
         var fsPromises = require("fs/promises");
         var contents = await fsPromises.readFile(packageName);
         return contents.buffer;
       }
       Module["dataFileDownloads"] ??= {};
-      try {
-        var response = await fetch(packageName);
-      } catch (e) {
-        throw new Error(`Network Error: ${packageName}`, {
-          e
-        });
-      }
-      if (!response.ok) {
-        throw new Error(`${response.status}: ${response.url}`);
-      }
+
+      const PART_COUNT = 16;
       const chunks = [];
-      const headers = response.headers;
-      const total = Number(headers.get("Content-Length") ?? packageSize);
       let loaded = 0;
+      const total = packageSize || 314500859;
       Module["setStatus"]?.("Downloading data...");
-      const reader = response.body.getReader();
-      while (1) {
-        var {done, value} = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        loaded += value.length;
+
+      // Download all 16 parts with retry protection against CDN rate-limits
+      for (let i = 1; i <= PART_COUNT; i++) {
+        const partUrl = `${packageName}.part${i}`;
+        let res;
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            res = await fetch(partUrl);
+            // If jsDelivr/CDN temporarily rate-limits (403/429), retry with query string
+            if (!res.ok && (res.status === 403 || res.status === 429)) {
+              await new Promise(r => setTimeout(r, 400 * attempt));
+              res = await fetch(`${partUrl}?t=${Date.now()}`);
+            }
+            if (res.ok) break;
+          } catch (e) {
+            if (attempt === 3) throw new Error(`Network Error: ${partUrl}`);
+            await new Promise(r => setTimeout(r, 400 * attempt));
+          }
+        }
+
+        if (!res || !res.ok) {
+          throw new Error(`Failed to load chunk ${res?.status || 404}: ${partUrl}`);
+        }
+
+        const buf = await res.arrayBuffer();
+        const u8 = new Uint8Array(buf);
+        chunks.push(u8);
+        loaded += u8.byteLength;
+
         Module["dataFileDownloads"][packageName] = {
-          loaded,
-          total
+          loaded: loaded,
+          total: total
         };
+
         let totalLoaded = 0;
         let totalSize = 0;
         for (const download of Object.values(Module["dataFileDownloads"])) {
           totalLoaded += download.loaded;
           totalSize += download.total;
         }
-        Module["setStatus"]?.(`Downloading data... (${totalLoaded}/${totalSize})`);
+        Module["setStatus"]?.(`Downloading data... (${(totalLoaded / 1048576).toFixed(1)}MB / ${(totalSize / 1048576).toFixed(1)}MB)`);
+
+        // Brief 60ms breather to prevent Cloudflare/jsDelivr connection drops
+        await new Promise(r => setTimeout(r, 60));
       }
-      const packageData = new Uint8Array(chunks.map(c => c.length).reduce((a, b) => a + b, 0));
+
+      // Reassemble the 16 parts into the single virtual data package
+      const packageData = new Uint8Array(loaded);
       let offset = 0;
       for (const chunk of chunks) {
         packageData.set(chunk, offset);
@@ -43416,6 +43437,51 @@ function gd_js_open_url(u) {
 
 gd_js_open_url.sig = "vi";
 
+function gd_js_pad_state(idx, ptr) {
+  var now = Date.now();
+  if (!Module.gdPads || now - Module.gdPadsAt > 100) {
+    Module.gdPads = navigator.getGamepads ? navigator.getGamepads() : [];
+    Module.gdPadsAt = now;
+  }
+  var pads = Module.gdPads, pad = null, seen = -1;
+  for (var i = 0; i < pads.length; ++i) {
+    if (!pads[i] || !pads[i].connected) continue;
+    if (++seen === idx) {
+      pad = pads[i];
+      break;
+    }
+  }
+  if (!pad) return 0;
+  var b = pad.buttons || [], ax = pad.axes || [];
+  var down = function(i) {
+    return b[i] && (b[i].pressed || b[i].value > .5) ? 1 : 0;
+  };
+  var map = [ [ 12, 1 ], [ 13, 2 ], [ 14, 4 ], [ 15, 8 ], [ 9, 16 ], [ 8, 32 ], [ 10, 64 ], [ 11, 128 ], [ 4, 256 ], [ 5, 512 ], [ 0, 4096 ], [ 1, 8192 ], [ 2, 16384 ], [ 3, 32768 ] ];
+  var mask = 0;
+  for (var m = 0; m < map.length; ++m) if (down(map[m][0])) mask |= map[m][1];
+  var trigger = function(i) {
+    var v = b[i] ? (b[i].value || (b[i].pressed ? 1 : 0)) : 0;
+    return Math.max(0, Math.min(255, Math.round(v * 255)));
+  };
+  var stick = function(i, flip) {
+    var v = ax[i] || 0;
+    if (flip) v = -v;
+    return Math.max(-32768, Math.min(32767, Math.round(v * 32767)));
+  };
+  var dv = new DataView(HEAPU8.buffer);
+  dv.setUint32(ptr, Math.round(pad.timestamp) >>> 0, true);
+  dv.setUint16(ptr + 4, mask, true);
+  dv.setUint8(ptr + 6, trigger(6));
+  dv.setUint8(ptr + 7, trigger(7));
+  dv.setInt16(ptr + 8, stick(0, false), true);
+  dv.setInt16(ptr + 10, stick(1, true), true);
+  dv.setInt16(ptr + 12, stick(2, false), true);
+  dv.setInt16(ptr + 14, stick(3, true), true);
+  return 1;
+}
+
+gd_js_pad_state.sig = "iii";
+
 // Imports from the Wasm binary.
 var _fflush = makeInvalidEarlyAccess("_fflush");
 
@@ -43539,6 +43605,7 @@ var wasmImports = {
   /** @export */ gd_js_key_down,
   /** @export */ gd_js_mouse_poll,
   /** @export */ gd_js_open_url,
+  /** @export */ gd_js_pad_state,
   /** @export */ gd_js_persist_save,
   /** @export */ gd_js_start_worker,
   /** @export */ glActiveTexture: _glActiveTexture,
